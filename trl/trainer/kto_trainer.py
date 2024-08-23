@@ -24,7 +24,6 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, 
 
 import numpy as np
 import torch
-import torch.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import PartialState
@@ -545,7 +544,6 @@ class KTOTrainer(Trainer):
                 _tokenize,
                 batched=True,
                 fn_kwargs={"tokenizer": self.tokenizer},
-                num_proc=args.dataset_num_proc,
                 desc="Tokenizing train dataset",
             )
 
@@ -563,8 +561,7 @@ class KTOTrainer(Trainer):
                 _get_kl_dataset,
                 batched=True,
                 batch_size=total_batch_size,
-                num_proc=args.dataset_num_proc,
-                desc="Extracting KL train dataset",
+                desc="Extracting KL train dataset"
             )
 
             # Prepare the datasets
@@ -602,7 +599,6 @@ class KTOTrainer(Trainer):
                     _tokenize,
                     fn_kwargs={"tokenizer": self.tokenizer},
                     batched=True,
-                    num_proc=args.dataset_num_proc,
                     desc="Tokenizing eval dataset",
                 )
 
@@ -611,8 +607,7 @@ class KTOTrainer(Trainer):
                     _get_kl_dataset,
                     batched=True,
                     batch_size=total_batch_size,
-                    num_proc=args.dataset_num_proc,
-                    desc="Extracting eval KL dataset",
+                    desc="Extracting eval KL dataset"
                 )
 
                 # Process
@@ -1044,43 +1039,41 @@ class KTOTrainer(Trainer):
         reference_rejected_logps: torch.FloatTensor,
         reference_KL_logps: torch.FloatTensor,
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
-        """Compute the KTO loss for a batch of policy and reference model log probabilities.
-
-        Args:
-            policy_chosen_logps: Log probabilities of the policy model for the chosen responses. Shape: (num(chosen) in batch_size,)
-            policy_rejected_logps: Log probabilities of the policy model for the rejected responses. Shape: (num(rejected) in batch_size,)
-            policy_KL_logps: Log probabilities of the policy model for the KL responses. Shape: (batch_size,)
-            reference_chosen_logps: Log probabilities of the reference model for the chosen responses. Shape: (num(chosen) in batch_size,)
-            reference_rejected_logps: Log probabilities of the reference model for the rejected responses. Shape: (num(rejected) in batch_size,)
-            reference_KL_logps: Log probabilities of the reference model for the KL responses. Shape: (batch_size,)
-
-        Returns:
-            A tuple of four tensors: (losses, chosen_rewards, rejected_rewards, KL).
-            The losses tensor contains the KTO loss for each example in the batch.
-            The chosen_rewards and rejected_rewards tensors contain the rewards for the chosen and rejected responses, respectively.
-            The KL tensor contains the detached KL divergence estimate between the policy and reference models.
-        """
+        # Calculate KL divergence
         kl = (policy_KL_logps - reference_KL_logps).mean().detach()
         kl = self.accelerator.gather(kl).mean().clamp(min=0)
 
         if policy_chosen_logps.shape[0] != 0 or reference_chosen_logps.shape[0] != 0:
+            # Original KTO loss for chosen completions
             chosen_logratios = policy_chosen_logps - reference_chosen_logps
             chosen_losses = 1 - F.sigmoid(self.beta * (chosen_logratios - kl))
+
+            # DPOP-inspired penalty: Penalize decrease in chosen probabilities
+            # This adds a penalty when policy_chosen_logps < reference_chosen_logps
+            dpop_penalty_chosen = torch.max(torch.zeros_like(chosen_logratios), -chosen_logratios)
+            chosen_losses += dpop_penalty_chosen
+
             chosen_rewards = self.beta * chosen_logratios.detach()
         else:
-            # lists can't be empty -- if they are, then accelerate.gather will hang
             chosen_losses = torch.Tensor([]).to(self.accelerator.device)
             chosen_rewards = torch.Tensor([]).to(self.accelerator.device)
 
         if policy_rejected_logps.shape[0] != 0 or reference_rejected_logps.shape[0] != 0:
+            # Original KTO loss for rejected completions
             rejected_logratios = policy_rejected_logps - reference_rejected_logps
             rejected_losses = 1 - F.sigmoid(self.beta * (kl - rejected_logratios))
+
+            # New penalty: Penalize increase in rejected probabilities
+            # This adds a penalty when policy_rejected_logps > reference_rejected_logps
+            #dpop_penalty_rejected = torch.max(torch.zeros_like(rejected_logratios), rejected_logratios)
+            #rejected_losses += dpop_penalty_rejected
+
             rejected_rewards = self.beta * rejected_logratios.detach()
         else:
-            # lists can't be empty -- if they are, then accelerate.gather will hang
             rejected_losses = torch.Tensor([]).to(self.accelerator.device)
             rejected_rewards = torch.Tensor([]).to(self.accelerator.device)
 
+        # Combine losses with their respective weights
         losses = torch.cat(
             (self.desirable_weight * chosen_losses, self.undesirable_weight * rejected_losses),
             0,
@@ -1181,9 +1174,9 @@ class KTOTrainer(Trainer):
                 "compute_loss is only implemented for DPODataCollatorWithPadding, and you passed a datacollator that is different than "
                 "DPODataCollatorWithPadding - you might see unexpected behavior. Alternatively, you can implement your own prediction_step method if you are using a custom data collator"
             )
-        compute_loss_context_manager = amp.autocast("cuda") if self._peft_has_been_casted_to_bf16 else nullcontext()
+        compute_loss_context_manager = torch.cuda.amp.autocast if self._peft_has_been_casted_to_bf16 else nullcontext
 
-        with compute_loss_context_manager:
+        with compute_loss_context_manager():
             loss, metrics = self.get_batch_loss_metrics(model, inputs)
 
         # Make sure to move the loss to the device the original accumulating loss is at back in the `Trainer` class:
@@ -1210,9 +1203,9 @@ class KTOTrainer(Trainer):
 
         # If one uses `generate_during_eval` with peft + bf16, we need to explicitly call generate with
         # the torch cuda amp context manager as some hidden states are silently casted to full precision.
-        generate_context_manager = amp.autocast("cuda") if self._peft_has_been_casted_to_bf16 else nullcontext()
+        generate_context_manager = nullcontext if not self._peft_has_been_casted_to_bf16 else torch.cuda.amp.autocast
 
-        with generate_context_manager:
+        with generate_context_manager():
             policy_output = model.generate(
                 input_ids=batch["prompt_input_ids"],
                 attention_mask=batch["prompt_attention_mask"],
@@ -1269,8 +1262,8 @@ class KTOTrainer(Trainer):
             else:
                 ignore_keys = []
 
-        prediction_context_manager = amp.autocast("cuda") if self._peft_has_been_casted_to_bf16 else nullcontext()
-        with torch.no_grad(), prediction_context_manager:
+        prediction_context_manager = torch.cuda.amp.autocast if self._peft_has_been_casted_to_bf16 else nullcontext
+        with torch.no_grad(), prediction_context_manager():
             loss, metrics = self.get_batch_loss_metrics(model, inputs)
 
         # force log the metrics
@@ -1390,7 +1383,6 @@ class KTOTrainer(Trainer):
         """
         Overwrite the `push_to_hub` method in order to force-add the tag "kto" when pushing the
         model on the Hub. Please refer to `~transformers.Trainer.push_to_hub` for more details.
-        Unlike the parent class, we don't use the `token` argument to mitigate security risks.
         """
         kwargs = trl_sanitze_kwargs_for_tagging(model=self.model, tag_names=self._tag_names, kwargs=kwargs)
         return super().push_to_hub(commit_message=commit_message, blocking=blocking, **kwargs)
